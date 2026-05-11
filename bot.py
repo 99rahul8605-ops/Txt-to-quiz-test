@@ -86,6 +86,9 @@ TOKEN_MESSAGES = {}  # user_id -> (chat_id, message_id)
 # Reference to bot application for use in background tasks
 application_ref = [None]
 
+# Reference to the async event loop (for Flask -> async bridge)
+ASYNC_LOOP = [None]
+
 # Flask app for health checks and Mini Web App
 app = Flask(__name__)
 
@@ -100,6 +103,25 @@ def serve_webapp():
     """Serve the Mini Web App HTML page"""
     return send_from_directory('.', 'webapp.html')
 
+async def _db_get_temp_param(user_id):
+    """Async helper: get temp param from DB"""
+    try:
+        if DB is not None:
+            doc = await DB.temp_params.find_one({"user_id": user_id})
+            if doc:
+                return doc.get("param")
+    except Exception as e:
+        logger.error(f"DB temp_param get error: {e}")
+    return None
+
+async def _db_delete_temp_param(user_id):
+    """Async helper: delete temp param from DB"""
+    try:
+        if DB is not None:
+            await DB.temp_params.delete_one({"user_id": user_id})
+    except Exception as e:
+        logger.error(f"DB temp_param delete error: {e}")
+
 @app.route('/claim', methods=['POST'])
 def claim_reward():
     """API endpoint called by webapp after user watches ad"""
@@ -113,9 +135,21 @@ def claim_reward():
 
         user_id = int(user_id)
 
-        # Validate param
+        # Step 1: Check in-memory first (fast path)
         stored_param = temp_params.get(user_id)
+
+        # Step 2: If not in memory (restart/redeploy), check DB
+        if not stored_param and ASYNC_LOOP[0] is not None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    _db_get_temp_param(user_id), ASYNC_LOOP[0]
+                )
+                stored_param = future.result(timeout=5)
+            except Exception as e:
+                logger.error(f"DB param fetch error: {e}")
+
         if not stored_param or stored_param != param:
+            logger.warning(f"Claim failed for user {user_id}: param mismatch. Got={param}, Stored={stored_param}")
             return jsonify({"ok": False, "error": "Invalid or expired session"}), 403
 
         # Store token in pending_tokens dict — bot's async loop will pick it up
@@ -126,10 +160,16 @@ def claim_reward():
             "quiz_used": 0
         }
 
-        # Remove temp param after successful claim
+        # Remove temp param from memory and DB
         temp_params.pop(user_id, None)
-        # Clear token cache
         TOKEN_CACHE.pop(user_id, None)
+        if ASYNC_LOOP[0] is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _db_delete_temp_param(user_id), ASYNC_LOOP[0]
+                )
+            except Exception:
+                pass
 
         return jsonify({"ok": True, "message": "Access granted for 24 hours!"})
 
@@ -229,6 +269,16 @@ async def create_invite_index():
             logger.info("Created index for invite_points and redeem_requests")
     except Exception as e:
         logger.error(f"Error creating invite index: {e}")
+
+# Create index for saved_quizzes collection
+async def create_quiz_index():
+    try:
+        if DB is not None:
+            await DB.saved_quizzes.create_index("quiz_id", unique=True)
+            await DB.saved_quizzes.create_index("user_id")
+            logger.info("Created index for saved_quizzes")
+    except Exception as e:
+        logger.error(f"Error creating quiz index: {e}")
 
 # Optimized user interaction recording
 async def record_user_interaction(update: Update):
@@ -503,6 +553,14 @@ async def token_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     user_id = user.id
 
+    # Block during active quiz in this chat
+    if await is_quiz_running(update.effective_chat.id):
+        await update.message.reply_text(
+            "⏳ Quiz chal rahi hai! Pehle /stopquiz se rok do.",
+            parse_mode='Markdown'
+        )
+        return
+
     # Premium and sudo users don't need tokens
     if await is_sudo(user_id) or await is_premium(user_id):
         await update.message.reply_text(
@@ -616,8 +674,84 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 # Token verification helper
+# ─── QUIZ ACTIVE GUARD ────────────────────────────────────────────────────────
+
+def get_active_session_for_chat(chat_id: int):
+    """Return (session_id, session) if a quiz is running in this chat, else None"""
+    for sid, sess in ACTIVE_QUIZ_SESSIONS.items():
+        if sess.get("chat_id") == chat_id:
+            return sid, sess
+    return None
+
+async def is_quiz_running(chat_id: int) -> bool:
+    return get_active_session_for_chat(chat_id) is not None
+
+async def stopquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop an active quiz — DM: only starter | Group: starter or admin"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type  # 'private', 'group', 'supergroup'
+
+    result = get_active_session_for_chat(chat_id)
+    if not result:
+        await update.message.reply_text("⚠️ Is chat mein koi quiz nahi chal rahi abhi.")
+        return
+
+    session_id, session = result
+    owner_id = session.get("owner_id")
+
+    # Permission check
+    allowed = False
+
+    if chat_type == "private":
+        # DM mein sirf starter allowed hai (ya sudo)
+        allowed = (user_id == owner_id) or await is_sudo(user_id)
+    else:
+        # Group mein: starter, sudo, ya group admin
+        if user_id == owner_id or await is_sudo(user_id):
+            allowed = True
+        else:
+            try:
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                if member.status in ("administrator", "creator"):
+                    allowed = True
+            except Exception:
+                pass
+
+    if not allowed:
+        await update.message.reply_text(
+            "🚫 Sirf quiz start karne wala ya group admin hi quiz rok sakta hai."
+        )
+        return
+
+    # Stop the quiz
+    ACTIVE_QUIZ_SESSIONS.pop(session_id, None)
+    title = session.get('title', 'Unknown')
+    done = session.get('current_index', 0)
+    total = len(session.get('questions', []))
+    await update.message.reply_text(
+        f"🛑 *Quiz rok di gayi!*\n\n"
+        f"📋 Quiz: *{title}*\n"
+        f"❓ Completed: {done}/{total} questions",
+        parse_mode='Markdown'
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # Block all commands while a quiz is active in this chat
+    if await is_quiz_running(chat_id):
+        await update.message.reply_text(
+            "⏳ *Quiz chal rahi hai!*\n\n"
+            "Quiz khatam hone tak doosre commands nahi chalenge.\n"
+            "Quiz rok ne ke liye /stopquiz use karein.",
+            parse_mode='Markdown'
+        )
+        return
+
     if await is_sudo(user_id) or await is_premium(user_id) or await has_valid_token(user_id):
         return await handler(update, context)
     
@@ -659,8 +793,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             quiz_id = arg[5:]
             chat_id = update.effective_chat.id
             try:
-                from bson import ObjectId
-                quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+                quiz_doc = await DB.saved_quizzes.find_one({"quiz_id": quiz_id})
                 if quiz_doc:
                     session_id = str(chat_id) + "_" + quiz_id
                     ACTIVE_QUIZ_SESSIONS[session_id] = {
@@ -671,7 +804,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         "owner_id": user_id,
                         "poll_message_id": None,
                         "active_poll_id": None,
-                        "scores": {}
+                        "scores": {},
+                        "open_period": quiz_doc.get("open_period", 10)
                     }
                     await update.message.reply_text(
                         "Quiz shuru ho rahi hai: *" + quiz_doc["title"] + "*\nTotal " + str(quiz_doc["total"]) + " questions! Taiyaar ho jao! 🎯",
@@ -1780,7 +1914,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     results = []
     bot_username = (await context.bot.get_me()).username
     for q in quizzes[:10]:
-        quiz_id = str(q["_id"])
+        quiz_id = str(q.get("quiz_id", str(q["_id"])))
         startgroup_link = "https://t.me/" + bot_username + "?startgroup=quiz_" + quiz_id
         results.append(
             InlineQueryResultArticle(
@@ -1813,8 +1947,7 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
         return
     quiz_id = parts[1].split("@")[0].strip()  # remove bot username if present
     try:
-        from bson import ObjectId
-        quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+        quiz_doc = await DB.saved_quizzes.find_one({"quiz_id": quiz_id})
     except Exception:
         await update.message.reply_text("Quiz nahi mili. Sahi ID use karein.")
         return
@@ -1842,6 +1975,11 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
 
 # ─── SAVED QUIZ HELPERS ───────────────────────────────────────────────────────
 
+def generate_quiz_id(length=10):
+    """Generate a short alphanumeric quiz ID"""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
 async def save_quiz_to_db(user_id: int, title: str, questions: list, open_period: int = 10) -> bool:
     """Save quiz questions to MongoDB"""
     if DB is None:
@@ -1855,11 +1993,16 @@ async def save_quiz_to_db(user_id: int, title: str, questions: list, open_period
                 "correct_option_id": correct_id,
                 "explanation": explanation
             })
+        # Check if quiz with same user_id+title already exists — reuse its quiz_id
+        existing = await DB.saved_quizzes.find_one({"user_id": user_id, "title": title})
+        quiz_id = existing["quiz_id"] if existing and "quiz_id" in existing else generate_quiz_id()
+
         await DB.saved_quizzes.update_one(
             {"user_id": user_id, "title": title},
             {"$set": {
                 "user_id": user_id,
                 "title": title,
+                "quiz_id": quiz_id,
                 "questions": questions_data,
                 "created_at": datetime.utcnow(),
                 "total": len(questions_data),
@@ -1969,17 +2112,30 @@ async def send_quiz_question(bot, session_id: str):
         session["poll_message_id"] = sent.message_id
         session["active_poll_id"] = sent.poll.id if sent.poll else None
         session["current_index"] = idx + 1
+        session["answered"] = False  # reset per question
         ACTIVE_QUIZ_SESSIONS[session_id] = session
+
+        # DM: chat_id > 0; Group: chat_id < 0
+        is_dm = chat_id > 0
 
         # Schedule next question after poll timer ends + 3 sec buffer
         bot_ref = bot
 
         async def next_after_timer(sid, b, period):
             await asyncio.sleep(period + 3)
-            if sid in ACTIVE_QUIZ_SESSIONS:
+            sess = ACTIVE_QUIZ_SESSIONS.get(sid)
+            # DM mein agar user ne answer de diya tha toh timer fire nahi karna
+            if sess and not sess.get("answered", False):
                 await send_quiz_question(b, sid)
+            elif sess and sess.get("answered", False):
+                pass  # already handled by poll answer handler
 
-        asyncio.create_task(next_after_timer(session_id, bot_ref, open_period))
+        task = asyncio.create_task(next_after_timer(session_id, bot_ref, open_period))
+
+        # DM sessions mein task store karo taaki answer pe cancel kar sakein
+        if is_dm:
+            session["timer_task"] = task
+            ACTIVE_QUIZ_SESSIONS[session_id] = session
 
     except Exception as e:
         logger.error(f"send_quiz_question error: {e}")
@@ -2044,13 +2200,43 @@ async def handle_poll_answer_track(update: Update, context: ContextTypes.DEFAULT
             scores[uid]["score"] += 1
 
         session["scores"] = scores
-        ACTIVE_QUIZ_SESSIONS[session_id] = session
+
+        # DM check: chat_id > 0 means private chat
+        is_dm = session.get("chat_id", 0) > 0
+
+        if is_dm and not session.get("answered", False):
+            # Mark as answered to prevent timer from firing too
+            session["answered"] = True
+            ACTIVE_QUIZ_SESSIONS[session_id] = session
+
+            # Cancel the scheduled timer task
+            timer_task = session.get("timer_task")
+            if timer_task and not timer_task.done():
+                timer_task.cancel()
+
+            # Short delay so Telegram shows the answer result, then next question
+            async def send_next_dm(sid, b):
+                await asyncio.sleep(1.5)
+                if sid in ACTIVE_QUIZ_SESSIONS:
+                    await send_quiz_question(b, sid)
+
+            asyncio.create_task(send_next_dm(session_id, context.bot))
+        else:
+            ACTIVE_QUIZ_SESSIONS[session_id] = session
+
         break
 
 async def myquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show user's saved quizzes"""
     await record_user_interaction(update)
     user_id = update.effective_user.id
+
+    if await is_quiz_running(update.effective_chat.id):
+        await update.message.reply_text(
+            "⏳ Quiz chal rahi hai! Pehle /stopquiz se rok do.",
+            parse_mode='Markdown'
+        )
+        return
     quizzes = await get_user_quizzes(user_id)
     if not quizzes:
         await update.message.reply_text("📭 Aapke paas koi saved quiz nahi hai.\n\nPehle /createquiz se ek quiz banayein!", parse_mode='Markdown')
@@ -2061,7 +2247,7 @@ async def myquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for i, q in enumerate(quizzes[:10], 1):
         text += f"{i}. *{q['title']}* — {q['total']} questions\n"
         keyboard.append([
-            InlineKeyboardButton(f"▶️ {q['title']}", callback_data="startq_" + str(q['_id'])),
+            InlineKeyboardButton(f"▶️ {q['title']}", callback_data="startq_" + str(q.get('quiz_id', str(q['_id'])))),
         ])
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_menu")])
 
@@ -2176,14 +2362,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ],
             [
                 InlineKeyboardButton("🕑 30 sec", callback_data="qtime_30"),
+                InlineKeyboardButton("🕓 45 sec", callback_data="qtime_45"),
                 InlineKeyboardButton("🕕 60 sec", callback_data="qtime_60"),
+            ],
+            [
+                InlineKeyboardButton("⏳ 2 min (120 sec)", callback_data="qtime_120"),
             ]
         ]
         await query.edit_message_text(
             "⏱ *Har question ke liye kitna time dena chahte hain?*\n\n"
             "• 10 sec — Fast (competitive)\n"
             "• 15-20 sec — Normal\n"
-            "• 30-60 sec — Easy / long questions",
+            "• 30-45 sec — Easy\n"
+            "• 60 sec / 2 min — Long questions",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -2198,8 +2389,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         data = PENDING_QUIZ_SAVE.pop(user_id)
         data["open_period"] = time_sec
         WAITING_QUIZ_TITLE[user_id] = data
+        time_label = f"{time_sec} seconds" if time_sec < 60 else ("1 minute" if time_sec == 60 else f"{time_sec // 60} minutes")
         await query.edit_message_text(
-            f"✅ Time set: *{time_sec} seconds* per question\n\n"
+            f"✅ Time set: *{time_label}* per question\n\n"
             "✏️ *Ab quiz ka naam/title likhein:*",
             parse_mode='Markdown'
         )
@@ -2215,8 +2407,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         quiz_id = query.data[7:]
         user_id = query.from_user.id
         try:
-            from bson import ObjectId
-            quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+            quiz_doc = await DB.saved_quizzes.find_one({"quiz_id": quiz_id})
         except Exception:
             await query.answer("Quiz nahi mila!", show_alert=True)
             return
@@ -2245,8 +2436,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id = query.message.chat_id
         user_id = query.from_user.id
         try:
-            from bson import ObjectId
-            quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+            quiz_doc = await DB.saved_quizzes.find_one({"quiz_id": quiz_id})
         except Exception:
             await query.answer("Quiz nahi mila!", show_alert=True)
             return
@@ -2264,7 +2454,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         }
         await query.edit_message_text(
             f"🚀 *{quiz_doc['title']}* shuru ho rahi hai!\n\n"
-            f"Total {quiz_doc['total']} questions. Shuru karte hain... 🎯",
+            f"Total {quiz_doc['total']} questions. Shuru karte hain... 🎯\n\n"
+            f"⚠️ Quiz khatam hone tak doosre commands kaam nahi karenge.\n"
+            f"Beech mein rokna ho to /stopquiz likhein.",
             parse_mode='Markdown'
         )
         await asyncio.sleep(1)
@@ -2291,8 +2483,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         quiz_id = query.data[5:]
         user_id = query.from_user.id
         try:
-            from bson import ObjectId
-            await DB.saved_quizzes.delete_one({"_id": ObjectId(quiz_id), "user_id": user_id})
+            await DB.saved_quizzes.delete_one({"quiz_id": quiz_id, "user_id": user_id})
             await query.edit_message_text("🗑️ Quiz delete ho gaya!")
         except Exception as e:
             await query.edit_message_text("⚠️ Delete karne mein error aaya.")
@@ -2307,7 +2498,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = []
         for i, q in enumerate(quizzes[:10], 1):
             text += f"{i}. *{q['title']}* — {q['total']} questions\n"
-            keyboard.append([InlineKeyboardButton("▶️ " + q['title'], callback_data="startq_" + str(q['_id']))])
+            keyboard.append([InlineKeyboardButton("▶️ " + q['title'], callback_data="startq_" + str(q.get('quiz_id', str(q['_id']))))])
         keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_menu")])
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -2421,7 +2612,8 @@ async def main_async() -> None:
             create_ttl_index(),
             create_sudo_index(),
             create_premium_index(),
-            create_invite_index()
+            create_invite_index(),
+            create_quiz_index()
         )
     
     # Get token from environment
@@ -2435,6 +2627,8 @@ async def main_async() -> None:
     application_ref[0] = application.bot
     
     # Add handlers
+    # stopquiz registered FIRST with group=0 so it works even during active quiz
+    application.add_handler(CommandHandler("stopquiz", stopquiz_command), group=0)
     application.add_handler(CommandHandler("start", start_wrapper))
     application.add_handler(CommandHandler("help", help_command_wrapper))
     application.add_handler(CommandHandler("createquiz", create_quiz_wrapper))
