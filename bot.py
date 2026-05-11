@@ -1032,17 +1032,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     POLL_QUESTION_LIMIT = 300
 
                     if len(question) > POLL_QUESTION_LIMIT:
-                        # Step 1: Send full question + options as a text message
+                        # Step 1: Send full question + options in code block
                         option_labels = ['A', 'B', 'C', 'D']
-                        msg_text = "📋 <b>Question:</b>\n" + html.escape(question) + "\n\n"
+                        options_text = ""
                         for idx, opt in enumerate(options):
                             opt_clean = opt_prefix_re.sub('', opt).strip()
-                            msg_text += "<b>" + option_labels[idx] + ")</b> " + html.escape(opt_clean) + "\n"
+                            options_text += option_labels[idx] + ") " + opt_clean + "\n"
+
+                        msg_text = "📋 *Question:*\n```\n" + question + "\n\n" + options_text.rstrip() + "\n```"
 
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
                             text=msg_text,
-                            parse_mode='HTML'
+                            parse_mode='Markdown'
                         )
 
                         # Step 2: Send poll with placeholder question and A/B/C/D options
