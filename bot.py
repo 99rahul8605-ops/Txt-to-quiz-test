@@ -65,6 +65,16 @@ CACHE_EXPIRY = 60  # seconds
 # Broadcast state
 BROADCAST_STATE = {}
 
+# Active quiz sessions for group quiz feature
+# { session_id: { chat_id, questions, current_index, poll_message_id, owner_id, title } }
+ACTIVE_QUIZ_SESSIONS = {}
+
+# Pending save confirmations { user_id: { questions: [...], chat_id: int } }
+PENDING_QUIZ_SAVE = {}
+
+# Waiting for quiz title input { user_id: { questions: [...], chat_id: int } }
+WAITING_QUIZ_TITLE = {}
+
 # Pending token rewards from webapp (Flask -> async bot bridge)
 pending_tokens = {}
 
@@ -1113,6 +1123,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await msg.edit_text(
                 f"✅ Successfully sent {sent_count} quiz questions!"
             )
+
+            # Ask user if they want to save this quiz
+            PENDING_QUIZ_SAVE[user_id] = {
+                "questions": valid_questions,
+                "chat_id": update.effective_chat.id
+            }
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes, Save Quiz", callback_data="save_quiz_yes"),
+                    InlineKeyboardButton("❌ No", callback_data="save_quiz_no")
+                ]
+            ]
+            await update.message.reply_text(
+                "💾 *Kya aap ye quiz save karna chahte hain?*\n\nSave karne ke baad aap ise group mein bhi run kar sakte hain!",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         else:
             await update.message.reply_text("❌ No valid questions found in file")
             
@@ -1317,6 +1344,28 @@ async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Check if user is in broadcast state
     user_id = update.effective_user.id
+
+    # Check if user is inputting quiz title
+    if user_id in WAITING_QUIZ_TITLE and update.message and update.message.text:
+        title = update.message.text.strip()
+        if not title:
+            await update.message.reply_text("Khaali title nahi chalta. Dobara likhein:")
+            return
+        data = WAITING_QUIZ_TITLE.pop(user_id)
+        questions = data["questions"]
+        success = await save_quiz_to_db(user_id, title, questions)
+        if success:
+            keyboard = [
+                [InlineKeyboardButton("📚 My Quizzes", callback_data="back_myquiz")]
+            ]
+            await update.message.reply_text(
+                "Quiz Save Ho Gayi!\n\nTitle: " + title + "\nQuestions: " + str(len(questions)) + "\n\nAap /myquiz se apni quizzes dekh sakte hain.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.message.reply_text("Save karne mein error aaya. Dobara try karein.")
+        return
+
     if user_id not in BROADCAST_STATE or BROADCAST_STATE[user_id]['state'] != 'waiting_message':
         return
         
@@ -1665,6 +1714,218 @@ async def my_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(response_text, parse_mode='Markdown')
 
 # Button handler
+async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /startquiz_<quiz_id> command in groups"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    text = update.message.text or ""
+    # Extract quiz_id from command like /startquiz_<id>
+    parts = text.strip().split("_", 1)
+    if len(parts) < 2:
+        await update.message.reply_text("Invalid command format.")
+        return
+    quiz_id = parts[1].split("@")[0].strip()  # remove bot username if present
+    try:
+        from bson import ObjectId
+        quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+    except Exception:
+        await update.message.reply_text("Quiz nahi mili. Sahi ID use karein.")
+        return
+    if not quiz_doc:
+        await update.message.reply_text("Quiz nahi mili.")
+        return
+
+    session_id = str(chat_id) + "_" + quiz_id
+    ACTIVE_QUIZ_SESSIONS[session_id] = {
+        "chat_id": chat_id,
+        "questions": quiz_doc["questions"],
+        "current_index": 0,
+        "title": quiz_doc["title"],
+        "owner_id": user_id,
+        "poll_message_id": None,
+        "active_poll_id": None
+    }
+    await update.message.reply_text(
+        "Quiz shuru ho rahi hai: " + quiz_doc["title"] + "\nTotal " + str(quiz_doc["total"]) + " questions!"
+    )
+    await asyncio.sleep(1)
+    await send_quiz_question(context.bot, session_id)
+
+# ─── SAVED QUIZ HELPERS ───────────────────────────────────────────────────────
+
+async def save_quiz_to_db(user_id: int, title: str, questions: list) -> bool:
+    """Save quiz questions to MongoDB"""
+    if DB is None:
+        return False
+    try:
+        questions_data = []
+        for q, opts, correct_id, explanation in questions:
+            questions_data.append({
+                "question": q,
+                "options": opts,
+                "correct_option_id": correct_id,
+                "explanation": explanation
+            })
+        await DB.saved_quizzes.update_one(
+            {"user_id": user_id, "title": title},
+            {"$set": {
+                "user_id": user_id,
+                "title": title,
+                "questions": questions_data,
+                "created_at": datetime.utcnow(),
+                "total": len(questions_data)
+            }},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        logger.error(f"save_quiz_to_db error: {e}")
+        return False
+
+async def get_user_quizzes(user_id: int) -> list:
+    """Get all saved quizzes for a user"""
+    if DB is None:
+        return []
+    try:
+        cursor = DB.saved_quizzes.find({"user_id": user_id})
+        return await cursor.to_list(length=50)
+    except Exception as e:
+        logger.error(f"get_user_quizzes error: {e}")
+        return []
+
+async def send_quiz_question(bot, session_id: str):
+    """Send next question in an active quiz session"""
+    session = ACTIVE_QUIZ_SESSIONS.get(session_id)
+    if not session:
+        return
+
+    idx = session["current_index"]
+    questions = session["questions"]
+    chat_id = session["chat_id"]
+
+    if idx >= len(questions):
+        # Quiz finished
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"🏁 *Quiz Khatam!*\n\n✅ *{session['title']}* complete ho gaya!\n📊 Total Questions: {len(questions)}",
+            parse_mode='Markdown'
+        )
+        ACTIVE_QUIZ_SESSIONS.pop(session_id, None)
+        return
+
+    q = questions[idx]
+    question_text = q["question"]
+    options = q["options"]
+    correct_id = q["correct_option_id"]
+    explanation = q.get("explanation")
+
+    opt_prefix_re2 = __import__('re').compile(r'^[A-Da-d][\.\):\s]+')
+
+    try:
+        POLL_QUESTION_LIMIT = 300
+        if len(question_text) > POLL_QUESTION_LIMIT:
+            option_labels = ['A', 'B', 'C', 'D']
+            options_text = ""
+            for i, opt in enumerate(options):
+                opt_clean = opt_prefix_re2.sub('', opt).strip()
+                options_text += option_labels[i] + ") " + opt_clean + "\n"
+            msg_text = "*📋 Question:*\n```\n" + question_text + "\n\n" + options_text.rstrip() + "\n```"
+            await bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='Markdown')
+
+            poll_options = []
+            for i, label in enumerate(['A', 'B', 'C', 'D']):
+                opt_clean = opt_prefix_re2.sub('', options[i]).strip()
+                poll_options.append((label + ") " + opt_clean)[:100])
+
+            sent = await bot.send_poll(
+                chat_id=chat_id,
+                question="⬆️ Read above question and answers correctly",
+                options=poll_options,
+                type='quiz',
+                correct_option_id=correct_id,
+                is_anonymous=False,
+                open_period=10,
+                explanation=explanation[:200] if explanation else None
+            )
+        else:
+            poll_kwargs = {
+                "chat_id": chat_id,
+                "question": question_text,
+                "options": options,
+                "type": 'quiz',
+                "correct_option_id": correct_id,
+                "is_anonymous": False,
+                "open_period": 10
+            }
+            if explanation:
+                poll_kwargs["explanation"] = explanation
+            sent = await bot.send_poll(**poll_kwargs)
+
+        # Store poll info
+        session["poll_message_id"] = sent.message_id
+        session["active_poll_id"] = sent.poll.id if sent.poll else None
+        session["current_index"] = idx + 1
+        ACTIVE_QUIZ_SESSIONS[session_id] = session
+
+        # Schedule next question after poll timer ends (10 sec) + 3 sec buffer
+        bot_ref = bot
+
+        async def next_after_timer(sid, b):
+            await asyncio.sleep(13)
+            if sid in ACTIVE_QUIZ_SESSIONS:
+                await send_quiz_question(b, sid)
+
+        asyncio.create_task(next_after_timer(session_id, bot_ref))
+
+    except Exception as e:
+        logger.error(f"send_quiz_question error: {e}")
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggered when a quiz poll closes — send next question"""
+    poll = update.poll
+    if not poll or not poll.is_closed:
+        return
+
+    # Find session with matching poll
+    for session_id, session in list(ACTIVE_QUIZ_SESSIONS.items()):
+        if session.get("poll_message_id") and poll.id == session.get("poll_id"):
+            await asyncio.sleep(2)  # Small delay before next question
+            await send_quiz_question(context.bot, session_id)
+            break
+
+async def handle_poll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Called when a poll message is updated (closed). Triggers next question."""
+    if not update.poll:
+        return
+    poll = update.poll
+    if not poll.is_closed:
+        return
+    for session_id, session in list(ACTIVE_QUIZ_SESSIONS.items()):
+        if session.get("active_poll_id") == poll.id:
+            await asyncio.sleep(2)
+            await send_quiz_question(context.bot, session_id)
+            return
+
+async def myquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user's saved quizzes"""
+    await record_user_interaction(update)
+    user_id = update.effective_user.id
+    quizzes = await get_user_quizzes(user_id)
+    if not quizzes:
+        await update.message.reply_text("📭 Aapke paas koi saved quiz nahi hai.\n\nPehle /createquiz se ek quiz banayein!", parse_mode='Markdown')
+        return
+
+    text = "📚 *Aapke Saved Quizzes:*\n\n"
+    keyboard = []
+    for i, q in enumerate(quizzes[:10], 1):
+        text += f"{i}. *{q['title']}* — {q['total']} questions\n"
+        keyboard.append([
+            InlineKeyboardButton(f"▶️ {q['title']}", callback_data="startq_" + str(q['_id'])),
+        ])
+    keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_menu")])
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1760,6 +2021,114 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ]
 
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data == "save_quiz_yes":
+        user_id = query.from_user.id
+        if user_id not in PENDING_QUIZ_SAVE:
+            await query.edit_message_text("⚠️ Session expire ho gayi. Dobara file bhejein.")
+            return
+        await query.edit_message_text(
+            "✏️ *Quiz ka naam/title likhein:*",
+            parse_mode='Markdown'
+        )
+        WAITING_QUIZ_TITLE[user_id] = PENDING_QUIZ_SAVE.pop(user_id)
+
+    elif query.data == "save_quiz_no":
+        PENDING_QUIZ_SAVE.pop(query.from_user.id, None)
+        await query.edit_message_text("👍 Theek hai! Quiz save nahi kiya gaya.")
+
+    elif query.data == "close_menu":
+        await query.message.delete()
+
+    elif query.data.startswith("startq_"):
+        quiz_id = query.data[7:]
+        user_id = query.from_user.id
+        try:
+            from bson import ObjectId
+            quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+        except Exception:
+            await query.answer("Quiz nahi mila!", show_alert=True)
+            return
+        if not quiz_doc:
+            await query.answer("Quiz nahi mila!", show_alert=True)
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("▶️ Start Quiz Here", callback_data="runq_here_" + quiz_id)],
+            [InlineKeyboardButton("👥 Start in Group", callback_data="runq_group_" + quiz_id)],
+            [InlineKeyboardButton("📤 Share Quiz", switch_inline_query="quiz_" + quiz_id)],
+            [InlineKeyboardButton("🗑️ Delete Quiz", callback_data="delq_" + quiz_id)],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_myquiz")]
+        ]
+        await query.edit_message_text(
+            f"📋 *{quiz_doc['title']}*\n\n"
+            f"📊 Questions: {quiz_doc['total']}\n"
+            f"📅 Created: {format_ist(quiz_doc['created_at'])} IST\n\n"
+            f"Kya karna chahte hain?",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif query.data.startswith("runq_here_"):
+        quiz_id = query.data[10:]
+        chat_id = query.message.chat_id
+        user_id = query.from_user.id
+        try:
+            from bson import ObjectId
+            quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+        except Exception:
+            await query.answer("Quiz nahi mila!", show_alert=True)
+            return
+        session_id = str(user_id) + "_" + quiz_id
+        ACTIVE_QUIZ_SESSIONS[session_id] = {
+            "chat_id": chat_id,
+            "questions": quiz_doc["questions"],
+            "current_index": 0,
+            "title": quiz_doc["title"],
+            "owner_id": user_id,
+            "poll_message_id": None,
+            "active_poll_id": None
+        }
+        await query.edit_message_text(
+            f"🚀 *{quiz_doc['title']}* shuru ho rahi hai!\n\n"
+            f"Total {quiz_doc['total']} questions. Shuru karte hain... 🎯",
+            parse_mode='Markdown'
+        )
+        await asyncio.sleep(1)
+        await send_quiz_question(context.bot, session_id)
+
+    elif query.data.startswith("runq_group_"):
+        quiz_id = query.data[11:]
+        bot_username = (await context.bot.get_me()).username
+        share_text = f"Quiz shuru karne ke liye bot ko group mein add karein aur /startquiz_{quiz_id} command chalayein!"
+        await query.answer(
+            f"Group mein bot add karein aur ye command chalayein:\n/startquiz_{quiz_id}",
+            show_alert=True
+        )
+
+    elif query.data.startswith("delq_"):
+        quiz_id = query.data[5:]
+        user_id = query.from_user.id
+        try:
+            from bson import ObjectId
+            await DB.saved_quizzes.delete_one({"_id": ObjectId(quiz_id), "user_id": user_id})
+            await query.edit_message_text("🗑️ Quiz delete ho gaya!")
+        except Exception as e:
+            await query.edit_message_text("⚠️ Delete karne mein error aaya.")
+
+    elif query.data == "back_myquiz":
+        user_id = query.from_user.id
+        quizzes = await get_user_quizzes(user_id)
+        if not quizzes:
+            await query.edit_message_text("📭 Koi saved quiz nahi hai.")
+            return
+        text = "📚 *Aapke Saved Quizzes:*\n\n"
+        keyboard = []
+        for i, q in enumerate(quizzes[:10], 1):
+            text += f"{i}. *{q['title']}* — {q['total']} questions\n"
+            keyboard.append([InlineKeyboardButton("▶️ " + q['title'], callback_data="startq_" + str(q['_id']))])
+        keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close_menu")])
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 # Optimized token validation with caching
 async def has_valid_token(user_id):
@@ -1897,6 +2266,9 @@ async def main_async() -> None:
     application.add_handler(CommandHandler("points", points_command))
     application.add_handler(CommandHandler("redeem", redeem_command))
     application.add_handler(MessageHandler(filters.Document.TEXT, handle_document_wrapper))
+    application.add_handler(CommandHandler("myquiz", myquiz_command))
+    application.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/startquiz_"), startquiz_group_command))
+    application.add_handler(MessageHandler(filters.Poll(), handle_poll_close))
     
     # Add broadcast commands
     application.add_handler(CommandHandler("broadcast", broadcast_command))
