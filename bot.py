@@ -77,6 +77,10 @@ PENDING_QUIZ_SAVE = {}
 # Waiting for quiz title input { user_id: { questions: [...], chat_id: int } }
 WAITING_QUIZ_TITLE = {}
 
+# Pending group quiz approvals
+# { approval_id: { chat_id, quiz_doc, owner_id, joined: set(), message_id, expires_at } }
+PENDING_GROUP_QUIZ = {}
+
 # Pending token rewards from webapp (Flask -> async bot bridge)
 pending_tokens = {}
 
@@ -795,25 +799,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 quiz_doc = await DB.saved_quizzes.find_one({"quiz_id": quiz_id})
                 if quiz_doc:
-                    session_id = str(chat_id) + "_" + quiz_id
-                    ACTIVE_QUIZ_SESSIONS[session_id] = {
-                        "chat_id": chat_id,
-                        "questions": quiz_doc["questions"],
-                        "current_index": 0,
-                        "title": quiz_doc["title"],
-                        "quiz_id": quiz_id,
-                        "owner_id": user_id,
-                        "poll_message_id": None,
-                        "active_poll_id": None,
-                        "scores": {},
-                        "open_period": quiz_doc.get("open_period", 10)
-                    }
-                    await update.message.reply_text(
-                        "Quiz shuru ho rahi hai: *" + quiz_doc["title"] + "*\nTotal " + str(quiz_doc["total"]) + " questions! Taiyaar ho jao! 🎯",
-                        parse_mode='Markdown'
-                    )
-                    await asyncio.sleep(1)
-                    await send_quiz_question(context.bot, session_id)
+                    is_group = update.effective_chat.type in ("group", "supergroup")
+                    if is_group:
+                        await start_group_quiz_with_approval(context.bot, chat_id, quiz_doc, user_id)
+                    else:
+                        session_id = str(chat_id) + "_" + quiz_id
+                        ACTIVE_QUIZ_SESSIONS[session_id] = {
+                            "chat_id": chat_id,
+                            "questions": quiz_doc["questions"],
+                            "current_index": 0,
+                            "title": quiz_doc["title"],
+                            "quiz_id": quiz_id,
+                            "owner_id": user_id,
+                            "poll_message_id": None,
+                            "active_poll_id": None,
+                            "scores": {},
+                            "open_period": quiz_doc.get("open_period", 10)
+                        }
+                        msg = await update.message.reply_text(
+                            "📋 *" + quiz_doc["title"] + "*\n❓ " + str(quiz_doc["total"]) + " questions\n\nShuru ho rahi hai... 🎯",
+                            parse_mode='Markdown'
+                        )
+                        await countdown_and_start(context.bot, chat_id, session_id, msg.message_id)
                     return
                 else:
                     await update.message.reply_text("Quiz nahi mili. Shayad delete ho gayi.")
@@ -1966,24 +1973,28 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Quiz nahi mili.")
         return
 
-    session_id = str(chat_id) + "_" + quiz_id
-    ACTIVE_QUIZ_SESSIONS[session_id] = {
-        "chat_id": chat_id,
-        "questions": quiz_doc["questions"],
-        "current_index": 0,
-        "title": quiz_doc["title"],
-        "quiz_id": quiz_id,
-        "owner_id": user_id,
-        "poll_message_id": None,
-        "active_poll_id": None,
-        "scores": {},
-        "open_period": quiz_doc.get("open_period", 10)
-    }
-    await update.message.reply_text(
-        "Quiz shuru ho rahi hai: " + quiz_doc["title"] + "\nTotal " + str(quiz_doc["total"]) + " questions!"
-    )
-    await asyncio.sleep(1)
-    await send_quiz_question(context.bot, session_id)
+    is_group = update.effective_chat.type in ("group", "supergroup")
+    if is_group:
+        await start_group_quiz_with_approval(context.bot, chat_id, quiz_doc, user_id)
+    else:
+        session_id = str(chat_id) + "_" + quiz_id
+        ACTIVE_QUIZ_SESSIONS[session_id] = {
+            "chat_id": chat_id,
+            "questions": quiz_doc["questions"],
+            "current_index": 0,
+            "title": quiz_doc["title"],
+            "quiz_id": quiz_id,
+            "owner_id": user_id,
+            "poll_message_id": None,
+            "active_poll_id": None,
+            "scores": {},
+            "open_period": quiz_doc.get("open_period", 10)
+        }
+        msg = await update.message.reply_text(
+            f"📋 *{quiz_doc['title']}*\n❓ {quiz_doc['total']} questions\n\nShuru ho rahi hai... 🎯",
+            parse_mode='Markdown'
+        )
+        await countdown_and_start(context.bot, chat_id, session_id, msg.message_id)
 
 # ─── SAVED QUIZ HELPERS ───────────────────────────────────────────────────────
 
@@ -2037,6 +2048,93 @@ async def get_user_quizzes(user_id: int) -> list:
     except Exception as e:
         logger.error(f"get_user_quizzes error: {e}")
         return []
+
+
+async def countdown_and_start(bot, chat_id: int, session_id: str, countdown_msg_id: int = None):
+    """Edit a message with 5→1 countdown then start the quiz"""
+    title = ACTIVE_QUIZ_SESSIONS.get(session_id, {}).get('title', 'Quiz')
+    for i in range(5, 0, -1):
+        text = (
+            f"🎯 *{title}*\n\n"
+            f"⏳ Quiz shuru ho rahi hai...\n\n"
+            f"{'🔴' * i}{'⚪' * (5 - i)}  *{i}*"
+        )
+        try:
+            if countdown_msg_id:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=countdown_msg_id,
+                    text=text, parse_mode='Markdown'
+                )
+            else:
+                msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+                countdown_msg_id = msg.message_id
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=countdown_msg_id,
+            text=f"🚀 *{title}* — Shuru! 🎯", parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+    await send_quiz_question(bot, session_id)
+
+
+async def start_group_quiz_with_approval(bot, chat_id: int, quiz_doc: dict, owner_id: int):
+    """
+    In a group: send a join message, wait for ≥2 players to press Ready,
+    then countdown and start. Times out after 60 seconds.
+    """
+    import uuid as _uuid
+    approval_id = _uuid.uuid4().hex[:12]
+    expires_at = datetime.utcnow() + timedelta(seconds=60)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🙋 Ready to Play!", callback_data="join_quiz_" + approval_id)],
+        [InlineKeyboardButton("▶️ Start Now (owner only)", callback_data="forcestart_" + approval_id)],
+    ])
+
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📋 *{quiz_doc['title']}*\n"
+            f"❓ {quiz_doc['total']} questions\n\n"
+            f"Quiz shuru karne ke liye *kam se kam 2 players* chahiye!\n"
+            f"Neeche button dabao taiyaar hone ke liye 👇\n\n"
+            f"✅ Ready: 0 players\n"
+            f"⏰ 60 seconds mein auto-cancel ho jaayegi agar 2 log ready nahi hue."
+        ),
+        parse_mode='Markdown',
+        reply_markup=keyboard
+    )
+
+    PENDING_GROUP_QUIZ[approval_id] = {
+        "chat_id": chat_id,
+        "quiz_doc": quiz_doc,
+        "owner_id": owner_id,
+        "joined": set(),
+        "joined_names": {},
+        "message_id": msg.message_id,
+        "expires_at": expires_at,
+    }
+
+    # Background task: auto-cancel after timeout
+    async def auto_cancel():
+        await asyncio.sleep(62)
+        pending = PENDING_GROUP_QUIZ.pop(approval_id, None)
+        if pending:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=pending["message_id"],
+                    text="⏰ *Quiz cancelled!*\n\nKafi players ready nahi hue. Dobara try karein.",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+    asyncio.create_task(auto_cancel())
 
 async def send_quiz_question(bot, session_id: str):
     """Send next question in an active quiz session"""
@@ -2510,6 +2608,111 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+
+    elif query.data.startswith("join_quiz_"):
+        approval_id = query.data[10:]
+        user_id = query.from_user.id
+        pending = PENDING_GROUP_QUIZ.get(approval_id)
+        if not pending:
+            await query.answer("Quiz session expired ya start ho gayi!", show_alert=True)
+            return
+        if datetime.utcnow() > pending["expires_at"]:
+            await query.answer("Time out ho gaya!", show_alert=True)
+            return
+        name = query.from_user.first_name or "Player"
+        pending["joined"].add(user_id)
+        pending["joined_names"][user_id] = name
+        count = len(pending["joined"])
+        await query.answer(f"✅ Tum ready ho, {name}!")
+        # Update the join message
+        names_list = ", ".join(pending["joined_names"].values())
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🙋 Ready to Play!", callback_data="join_quiz_" + approval_id)],
+            [InlineKeyboardButton("▶️ Start Now (owner only)", callback_data="forcestart_" + approval_id)],
+        ])
+        try:
+            await query.edit_message_text(
+                f"📋 *{pending['quiz_doc']['title']}*\n"
+                f"❓ {pending['quiz_doc']['total']} questions\n\n"
+                "Quiz shuru karne ke liye *kam se kam 2 players* chahiye!\n"
+                "Neeche button dabao taiyaar hone ke liye 👇\n\n"
+                f"✅ Ready: {count} players — {names_list}\n"
+                "⏰ Auto-cancel hogi agar 2 log ready nahi hue.",
+                parse_mode='Markdown',
+                reply_markup=keyboard
+            )
+        except Exception:
+            pass
+        # Auto-start when 2+ players ready
+        if count >= 2:
+            PENDING_GROUP_QUIZ.pop(approval_id, None)
+            quiz_doc = pending["quiz_doc"]
+            chat_id = pending["chat_id"]
+            owner_id = pending["owner_id"]
+            quiz_id = quiz_doc["quiz_id"]
+            session_id = str(chat_id) + "_" + quiz_id
+            ACTIVE_QUIZ_SESSIONS[session_id] = {
+                "chat_id": chat_id,
+                "questions": quiz_doc["questions"],
+                "current_index": 0,
+                "title": quiz_doc["title"],
+                "quiz_id": quiz_id,
+                "owner_id": owner_id,
+                "poll_message_id": None,
+                "active_poll_id": None,
+                "scores": {},
+                "open_period": quiz_doc.get("open_period", 10)
+            }
+            # Edit join message to show countdown then start
+            try:
+                await query.edit_message_text(
+                    f"✅ *{count} players ready!*\n\n🚀 Starting in 5...",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+            await countdown_and_start(context.bot, chat_id, session_id, pending["message_id"])
+
+    elif query.data.startswith("forcestart_"):
+        approval_id = query.data[11:]
+        user_id = query.from_user.id
+        pending = PENDING_GROUP_QUIZ.get(approval_id)
+        if not pending:
+            await query.answer("Session expired ya quiz shuru ho gayi!", show_alert=True)
+            return
+        if user_id != pending["owner_id"]:
+            await query.answer("Sirf quiz start karne wala force start kar sakta hai!", show_alert=True)
+            return
+        count = len(pending["joined"])
+        if count < 1:
+            await query.answer("Koi bhi ready nahi hai abhi!", show_alert=True)
+            return
+        PENDING_GROUP_QUIZ.pop(approval_id, None)
+        quiz_doc = pending["quiz_doc"]
+        chat_id = pending["chat_id"]
+        owner_id = pending["owner_id"]
+        quiz_id = quiz_doc["quiz_id"]
+        session_id = str(chat_id) + "_" + quiz_id
+        ACTIVE_QUIZ_SESSIONS[session_id] = {
+            "chat_id": chat_id,
+            "questions": quiz_doc["questions"],
+            "current_index": 0,
+            "title": quiz_doc["title"],
+            "quiz_id": quiz_id,
+            "owner_id": owner_id,
+            "poll_message_id": None,
+            "active_poll_id": None,
+            "scores": {},
+            "open_period": quiz_doc.get("open_period", 10)
+        }
+        try:
+            await query.edit_message_text(
+                "✅ *Owner ne force start kiya!*\n\n🚀 Starting in 5...",
+                parse_mode='Markdown'
+            )
+        except Exception:
+            pass
+        await countdown_and_start(context.bot, chat_id, session_id, pending["message_id"])
 
     elif query.data.startswith("delq_"):
         quiz_id = query.data[5:]
