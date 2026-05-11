@@ -1390,13 +1390,18 @@ async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT
             return
         data = WAITING_QUIZ_TITLE.pop(user_id)
         questions = data["questions"]
-        success = await save_quiz_to_db(user_id, title, questions)
+        open_period = data.get("open_period", 10)
+        success = await save_quiz_to_db(user_id, title, questions, open_period)
         if success:
             keyboard = [
                 [InlineKeyboardButton("📚 My Quizzes", callback_data="back_myquiz")]
             ]
             await update.message.reply_text(
-                "Quiz Save Ho Gayi!\n\nTitle: " + title + "\nQuestions: " + str(len(questions)) + "\n\nAap /myquiz se apni quizzes dekh sakte hain.",
+                f"✅ Quiz Save Ho Gayi!\n\n"
+                f"📝 Title: {title}\n"
+                f"❓ Questions: {len(questions)}\n"
+                f"⏱ Time per question: {open_period} sec\n\n"
+                "Aap /myquiz se apni quizzes dekh sakte hain.",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
@@ -1826,7 +1831,8 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
         "owner_id": user_id,
         "poll_message_id": None,
         "active_poll_id": None,
-        "scores": {}
+        "scores": {},
+        "open_period": quiz_doc.get("open_period", 10)
     }
     await update.message.reply_text(
         "Quiz shuru ho rahi hai: " + quiz_doc["title"] + "\nTotal " + str(quiz_doc["total"]) + " questions!"
@@ -1836,7 +1842,7 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
 
 # ─── SAVED QUIZ HELPERS ───────────────────────────────────────────────────────
 
-async def save_quiz_to_db(user_id: int, title: str, questions: list) -> bool:
+async def save_quiz_to_db(user_id: int, title: str, questions: list, open_period: int = 10) -> bool:
     """Save quiz questions to MongoDB"""
     if DB is None:
         return False
@@ -1856,7 +1862,8 @@ async def save_quiz_to_db(user_id: int, title: str, questions: list) -> bool:
                 "title": title,
                 "questions": questions_data,
                 "created_at": datetime.utcnow(),
-                "total": len(questions_data)
+                "total": len(questions_data),
+                "open_period": open_period
             }},
             upsert=True
         )
@@ -1913,6 +1920,9 @@ async def send_quiz_question(bot, session_id: str):
     correct_id = q["correct_option_id"]
     explanation = q.get("explanation")
 
+    # Session mein stored open_period use karo, default 10 sec
+    open_period = session.get("open_period", 10)
+
     opt_prefix_re2 = __import__('re').compile(r'^[A-Da-d][\.\):\s]+')
 
     try:
@@ -1938,7 +1948,7 @@ async def send_quiz_question(bot, session_id: str):
                 type='quiz',
                 correct_option_id=correct_id,
                 is_anonymous=False,
-                open_period=10,
+                open_period=open_period,
                 explanation=explanation[:200] if explanation else None
             )
         else:
@@ -1949,7 +1959,7 @@ async def send_quiz_question(bot, session_id: str):
                 "type": 'quiz',
                 "correct_option_id": correct_id,
                 "is_anonymous": False,
-                "open_period": 10
+                "open_period": open_period
             }
             if explanation:
                 poll_kwargs["explanation"] = explanation
@@ -1961,15 +1971,15 @@ async def send_quiz_question(bot, session_id: str):
         session["current_index"] = idx + 1
         ACTIVE_QUIZ_SESSIONS[session_id] = session
 
-        # Schedule next question after poll timer ends (10 sec) + 3 sec buffer
+        # Schedule next question after poll timer ends + 3 sec buffer
         bot_ref = bot
 
-        async def next_after_timer(sid, b):
-            await asyncio.sleep(13)
+        async def next_after_timer(sid, b, period):
+            await asyncio.sleep(period + 3)
             if sid in ACTIVE_QUIZ_SESSIONS:
                 await send_quiz_question(b, sid)
 
-        asyncio.create_task(next_after_timer(session_id, bot_ref))
+        asyncio.create_task(next_after_timer(session_id, bot_ref, open_period))
 
     except Exception as e:
         logger.error(f"send_quiz_question error: {e}")
@@ -2158,11 +2168,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if user_id not in PENDING_QUIZ_SAVE:
             await query.edit_message_text("⚠️ Session expire ho gayi. Dobara file bhejein.")
             return
+        keyboard = [
+            [
+                InlineKeyboardButton("⚡ 10 sec", callback_data="qtime_10"),
+                InlineKeyboardButton("⏱ 15 sec", callback_data="qtime_15"),
+                InlineKeyboardButton("🕐 20 sec", callback_data="qtime_20"),
+            ],
+            [
+                InlineKeyboardButton("🕑 30 sec", callback_data="qtime_30"),
+                InlineKeyboardButton("🕕 60 sec", callback_data="qtime_60"),
+            ]
+        ]
         await query.edit_message_text(
-            "✏️ *Quiz ka naam/title likhein:*",
+            "⏱ *Har question ke liye kitna time dena chahte hain?*\n\n"
+            "• 10 sec — Fast (competitive)\n"
+            "• 15-20 sec — Normal\n"
+            "• 30-60 sec — Easy / long questions",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        # PENDING_QUIZ_SAVE ko abhi pop mat karo — time select hone par karenge
+
+    elif query.data.startswith("qtime_"):
+        user_id = query.from_user.id
+        if user_id not in PENDING_QUIZ_SAVE:
+            await query.edit_message_text("⚠️ Session expire ho gayi. Dobara file bhejein.")
+            return
+        time_sec = int(query.data.split("_")[1])
+        data = PENDING_QUIZ_SAVE.pop(user_id)
+        data["open_period"] = time_sec
+        WAITING_QUIZ_TITLE[user_id] = data
+        await query.edit_message_text(
+            f"✅ Time set: *{time_sec} seconds* per question\n\n"
+            "✏️ *Ab quiz ka naam/title likhein:*",
             parse_mode='Markdown'
         )
-        WAITING_QUIZ_TITLE[user_id] = PENDING_QUIZ_SAVE.pop(user_id)
 
     elif query.data == "save_quiz_no":
         PENDING_QUIZ_SAVE.pop(query.from_user.id, None)
@@ -2219,7 +2259,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "owner_id": user_id,
             "poll_message_id": None,
             "active_poll_id": None,
-            "scores": {}
+            "scores": {},
+            "open_period": quiz_doc.get("open_period", 10)
         }
         await query.edit_message_text(
             f"🚀 *{quiz_doc['title']}* shuru ho rahi hai!\n\n"
