@@ -1024,38 +1024,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"✅ Sending {len(valid_questions)} quiz question(s)..."
             )
             
+            opt_prefix_re = re.compile(r'^[A-Da-d][\.\):\s]+')
             sent_count = 0
             for question, options, correct_id, explanation in valid_questions:
                 try:
                     # Telegram poll question limit is 300 characters
                     POLL_QUESTION_LIMIT = 300
 
-                    # Check if question is too long for a poll
                     if len(question) > POLL_QUESTION_LIMIT:
                         # Step 1: Send full question + options as a text message
                         option_labels = ['A', 'B', 'C', 'D']
-                        msg_text = f"📋 <b>Question:</b>\n{html.escape(question)}\n\n"
+                        msg_text = "📋 <b>Question:</b>\n" + html.escape(question) + "\n\n"
                         for idx, opt in enumerate(options):
-                            # Strip existing option prefix if any (A), A., A: etc.
-                            opt_clean = re.sub(r'^[A-Da-d][\.\):\s]+', '', opt).strip()
-                            msg_text += f"<b>{option_labels[idx]})</b> {html.escape(opt_clean)}\n"
-                        
+                            opt_clean = opt_prefix_re.sub('', opt).strip()
+                            msg_text += "<b>" + option_labels[idx] + ")</b> " + html.escape(opt_clean) + "\n"
+
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
                             text=msg_text,
                             parse_mode='HTML'
                         )
 
-                        # Step 2: Send poll with short placeholder question and A/B/C/D options
-                        poll_options = [
-                            f"A) {re.sub(r'^[A-Da-d][\.\):\s]+', '', options[0]).strip()}",
-                            f"B) {re.sub(r'^[A-Da-d][\.\):\s]+', '', options[1]).strip()}",
-                            f"C) {re.sub(r'^[A-Da-d][\.\):\s]+', '', options[2]).strip()}",
-                            f"D) {re.sub(r'^[A-Da-d][\.\):\s]+', '', options[3]).strip()}",
-                        ]
-
-                        # Trim each poll option to Telegram's 100 char limit
-                        poll_options = [opt[:100] for opt in poll_options]
+                        # Step 2: Send poll with placeholder question and A/B/C/D options
+                        poll_options = []
+                        for idx, label in enumerate(['A', 'B', 'C', 'D']):
+                            opt_clean = opt_prefix_re.sub('', options[idx]).strip()
+                            poll_options.append((label + ") " + opt_clean)[:100])
 
                         poll_params = {
                             "chat_id": update.effective_chat.id,
@@ -1072,7 +1066,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         await context.bot.send_poll(**poll_params)
 
                     else:
-                        # Normal flow: question fits in poll directly
+                        # Normal flow
                         poll_params = {
                             "chat_id": update.effective_chat.id,
                             "question": question,
