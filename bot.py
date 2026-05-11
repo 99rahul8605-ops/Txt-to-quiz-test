@@ -1907,7 +1907,7 @@ async def send_quiz_question(bot, session_id: str):
         ACTIVE_QUIZ_SESSIONS.pop(session_id, None)
         return
 
-        q = questions[idx]
+    q = questions[idx]
     question_text = q["question"]
     options = q["options"]
     correct_id = q["correct_option_id"]
