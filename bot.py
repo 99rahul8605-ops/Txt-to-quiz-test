@@ -801,6 +801,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         "questions": quiz_doc["questions"],
                         "current_index": 0,
                         "title": quiz_doc["title"],
+                        "quiz_id": quiz_id,
                         "owner_id": user_id,
                         "poll_message_id": None,
                         "active_poll_id": None,
@@ -1891,7 +1892,7 @@ async def my_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # Button handler
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline queries for quiz sharing — @botname quiz_ID"""
+    """Handle inline queries for quiz sharing — @botname [title or quiz_ID]"""
     from telegram import InlineQueryResultArticle, InputTextMessageContent
     import uuid
     query = update.inline_query
@@ -1907,28 +1908,38 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer([], switch_pm_text="Pehle /createquiz se quiz banao!", switch_pm_parameter="start")
         return
 
-    # Filter by search text if provided
+    # Filter: match by quiz_id (exact) OR title (partial, case-insensitive)
     if search:
-        quizzes = [q for q in quizzes if search.lower() in q["title"].lower()]
+        # Strip "quiz_" prefix if it came from switch_inline_query="quiz_<id>"
+        clean_search = search[5:] if search.lower().startswith("quiz_") else search
+        filtered = []
+        for q in quizzes:
+            qid = str(q.get("quiz_id", str(q["_id"])))
+            if qid == clean_search or clean_search.lower() in q["title"].lower():
+                filtered.append(q)
+        quizzes = filtered
 
     results = []
     bot_username = (await context.bot.get_me()).username
     for q in quizzes[:10]:
         quiz_id = str(q.get("quiz_id", str(q["_id"])))
         startgroup_link = "https://t.me/" + bot_username + "?startgroup=quiz_" + quiz_id
+        start_dm_link = "https://t.me/" + bot_username + "?start=quiz_" + quiz_id
         results.append(
             InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
-                title="Quiz: " + q["title"],
-                description=str(q["total"]) + " questions — Group mein share karein",
+                title="📋 " + q["title"],
+                description=str(q["total"]) + " questions | ID: " + quiz_id,
                 input_message_content=InputTextMessageContent(
-                    "Quiz: *" + q["title"] + "*\n" +
-                    str(q["total"]) + " questions\n\n" +
-                    "Group mein start karne ke liye neeche button dabao!",
+                    "📋 *" + q["title"] + "*\n" +
+                    "❓ " + str(q["total"]) + " questions\n\n" +
+                    "Neeche buttons se quiz start karein! 👇",
                     parse_mode='Markdown'
                 ),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Quiz Start Karein", url=startgroup_link)]
+                    [InlineKeyboardButton("▶️ Start Quiz in Bot", url=start_dm_link)],
+                    [InlineKeyboardButton("👥 Start Quiz in Group", url=startgroup_link)],
+                    [InlineKeyboardButton("📤 Share Quiz", switch_inline_query="quiz_" + quiz_id)],
                 ])
             )
         )
@@ -1961,6 +1972,7 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
         "questions": quiz_doc["questions"],
         "current_index": 0,
         "title": quiz_doc["title"],
+        "quiz_id": quiz_id,
         "owner_id": user_id,
         "poll_message_id": None,
         "active_poll_id": None,
@@ -2040,6 +2052,7 @@ async def send_quiz_question(bot, session_id: str):
         # Quiz finished — show leaderboard
         scores = session.get("scores", {})
         total_q = len(questions)
+        quiz_id = session.get("quiz_id", "")
         if scores:
             sorted_scores = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
             medals = ["\U0001f947", "\U0001f948", "\U0001f949"]
@@ -2053,7 +2066,23 @@ async def send_quiz_question(bot, session_id: str):
             result_text = "\U0001f3c1 *Quiz Khatam!*\n\n" + "\U0001f4cb *" + session["title"] + "*\n" + "\U0001f4ca Total Questions: " + str(total_q) + "\n\n" + "\U0001f3c6 *Leaderboard:*\n\n" + leaderboard
         else:
             result_text = "\U0001f3c1 *Quiz Khatam!*\n\n" + "\U0001f4cb *" + session["title"] + "*\n" + "\U0001f4ca Total Questions: " + str(total_q) + "\n\nKisi ne bhi answer nahi kiya."
-        await bot.send_message(chat_id=chat_id, text=result_text, parse_mode='Markdown')
+
+        # Share keyboard — only if we have a quiz_id
+        share_markup = None
+        if quiz_id:
+            try:
+                bot_username = (await bot.get_me()).username
+                startgroup_link = "https://t.me/" + bot_username + "?startgroup=quiz_" + quiz_id
+                start_dm_link = "https://t.me/" + bot_username + "?start=quiz_" + quiz_id
+                share_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("▶️ Start Quiz in Bot", url=start_dm_link)],
+                    [InlineKeyboardButton("👥 Start Quiz in Group", url=startgroup_link)],
+                    [InlineKeyboardButton("📤 Share Quiz", switch_inline_query="quiz_" + quiz_id)],
+                ])
+            except Exception:
+                pass
+
+        await bot.send_message(chat_id=chat_id, text=result_text, parse_mode='Markdown', reply_markup=share_markup)
         ACTIVE_QUIZ_SESSIONS.pop(session_id, None)
         return
 
@@ -2448,6 +2477,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "questions": quiz_doc["questions"],
             "current_index": 0,
             "title": quiz_doc["title"],
+            "quiz_id": quiz_id,
             "owner_id": user_id,
             "poll_message_id": None,
             "active_poll_id": None,
