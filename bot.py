@@ -19,7 +19,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
     ApplicationBuilder,
-    CallbackQueryHandler
+    CallbackQueryHandler,
+    PollAnswerHandler
 )
 from telegram.error import RetryAfter, BadRequest
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -1743,7 +1744,8 @@ async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_
         "title": quiz_doc["title"],
         "owner_id": user_id,
         "poll_message_id": None,
-        "active_poll_id": None
+        "active_poll_id": None,
+        "scores": {}
     }
     await update.message.reply_text(
         "Quiz shuru ho rahi hai: " + quiz_doc["title"] + "\nTotal " + str(quiz_doc["total"]) + " questions!"
@@ -1804,16 +1806,27 @@ async def send_quiz_question(bot, session_id: str):
     chat_id = session["chat_id"]
 
     if idx >= len(questions):
-        # Quiz finished
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"🏁 *Quiz Khatam!*\n\n✅ *{session['title']}* complete ho gaya!\n📊 Total Questions: {len(questions)}",
-            parse_mode='Markdown'
-        )
+        # Quiz finished — show leaderboard
+        scores = session.get("scores", {})
+        total_q = len(questions)
+        if scores:
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+            medals = ["\U0001f947", "\U0001f948", "\U0001f949"]
+            leaderboard = ""
+            for rank, (uid, data) in enumerate(sorted_scores, 1):
+                medal = medals[rank - 1] if rank <= 3 else str(rank) + "."
+                name = data.get("name", "User")
+                sc = data["score"]
+                pct = int((sc / total_q) * 100)
+                leaderboard += medal + " " + name + " - " + str(sc) + "/" + str(total_q) + " (" + str(pct) + "%)\n"
+            result_text = "\U0001f3c1 *Quiz Khatam!*\n\n" + "\U0001f4cb *" + session["title"] + "*\n" + "\U0001f4ca Total Questions: " + str(total_q) + "\n\n" + "\U0001f3c6 *Leaderboard:*\n\n" + leaderboard
+        else:
+            result_text = "\U0001f3c1 *Quiz Khatam!*\n\n" + "\U0001f4cb *" + session["title"] + "*\n" + "\U0001f4ca Total Questions: " + str(total_q) + "\n\nKisi ne bhi answer nahi kiya."
+        await bot.send_message(chat_id=chat_id, text=result_text, parse_mode='Markdown')
         ACTIVE_QUIZ_SESSIONS.pop(session_id, None)
         return
 
-    q = questions[idx]
+        q = questions[idx]
     question_text = q["question"]
     options = q["options"]
     correct_id = q["correct_option_id"]
@@ -1905,6 +1918,43 @@ async def handle_poll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             await send_quiz_question(context.bot, session_id)
             return
+
+async def handle_poll_answer_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track user poll answers to build leaderboard"""
+    answer = update.poll_answer
+    if not answer:
+        return
+
+    poll_id = answer.poll_id
+    user = answer.user
+    chosen = answer.option_ids  # list of chosen option indices
+
+    # Find matching session
+    for session_id, session in list(ACTIVE_QUIZ_SESSIONS.items()):
+        if session.get("active_poll_id") != poll_id:
+            continue
+
+        # Get correct answer for current question (already sent, index was incremented)
+        q_index = session["current_index"] - 1
+        questions = session["questions"]
+        if q_index < 0 or q_index >= len(questions):
+            break
+
+        correct_id = questions[q_index]["correct_option_id"]
+        is_correct = len(chosen) > 0 and chosen[0] == correct_id
+
+        uid = str(user.id)
+        scores = session.setdefault("scores", {})
+        if uid not in scores:
+            name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
+            scores[uid] = {"name": name.strip() or "User", "score": 0}
+
+        if is_correct:
+            scores[uid]["score"] += 1
+
+        session["scores"] = scores
+        ACTIVE_QUIZ_SESSIONS[session_id] = session
+        break
 
 async def myquiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show user's saved quizzes"""
@@ -2087,7 +2137,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "title": quiz_doc["title"],
             "owner_id": user_id,
             "poll_message_id": None,
-            "active_poll_id": None
+            "active_poll_id": None,
+            "scores": {}
         }
         await query.edit_message_text(
             f"🚀 *{quiz_doc['title']}* shuru ho rahi hai!\n\n"
@@ -2268,7 +2319,8 @@ async def main_async() -> None:
     application.add_handler(MessageHandler(filters.Document.TEXT, handle_document_wrapper))
     application.add_handler(CommandHandler("myquiz", myquiz_command))
     application.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/startquiz_"), startquiz_group_command))
-    application.add_handler(MessageHandler(filters.Poll(), handle_poll_close))
+    # Poll close is handled via PollAnswerHandler — no separate handler needed
+    application.add_handler(PollAnswerHandler(handle_poll_answer_track))
     
     # Add broadcast commands
     application.add_handler(CommandHandler("broadcast", broadcast_command))
