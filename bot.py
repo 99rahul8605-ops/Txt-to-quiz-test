@@ -20,7 +20,8 @@ from telegram.ext import (
     ContextTypes,
     ApplicationBuilder,
     CallbackQueryHandler,
-    PollAnswerHandler
+    PollAnswerHandler,
+    InlineQueryHandler
 )
 from telegram.error import RetryAfter, BadRequest
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -652,6 +653,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ── Handle referral deep-link (/start ref_XXXXXXX) ──────────────────────
     if context.args:
         arg = context.args[0]
+
+        # Handle quiz deep-link (/start quiz_QUIZID) — used when bot added to group
+        if arg.startswith("quiz_"):
+            quiz_id = arg[5:]
+            chat_id = update.effective_chat.id
+            try:
+                from bson import ObjectId
+                quiz_doc = await DB.saved_quizzes.find_one({"_id": ObjectId(quiz_id)})
+                if quiz_doc:
+                    session_id = str(chat_id) + "_" + quiz_id
+                    ACTIVE_QUIZ_SESSIONS[session_id] = {
+                        "chat_id": chat_id,
+                        "questions": quiz_doc["questions"],
+                        "current_index": 0,
+                        "title": quiz_doc["title"],
+                        "owner_id": user_id,
+                        "poll_message_id": None,
+                        "active_poll_id": None,
+                        "scores": {}
+                    }
+                    await update.message.reply_text(
+                        "Quiz shuru ho rahi hai: *" + quiz_doc["title"] + "*\nTotal " + str(quiz_doc["total"]) + " questions! Taiyaar ho jao! 🎯",
+                        parse_mode='Markdown'
+                    )
+                    await asyncio.sleep(1)
+                    await send_quiz_question(context.bot, session_id)
+                    return
+                else:
+                    await update.message.reply_text("Quiz nahi mili. Shayad delete ho gayi.")
+                    return
+            except Exception as e:
+                logger.error(f"Quiz deep link error: {e}")
+                await update.message.reply_text("Quiz start karne mein error aaya.")
+                return
+
         if arg.startswith("ref_"):
             try:
                 referrer_id = int(arg.split("_", 1)[1])
@@ -1715,6 +1751,51 @@ async def my_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(response_text, parse_mode='Markdown')
 
 # Button handler
+async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline queries for quiz sharing — @botname quiz_ID"""
+    from telegram import InlineQueryResultArticle, InputTextMessageContent
+    import uuid
+    query = update.inline_query
+    if not query:
+        return
+
+    user_id = query.from_user.id
+    search = query.query.strip()
+
+    # Get user quizzes
+    quizzes = await get_user_quizzes(user_id)
+    if not quizzes:
+        await query.answer([], switch_pm_text="Pehle /createquiz se quiz banao!", switch_pm_parameter="start")
+        return
+
+    # Filter by search text if provided
+    if search:
+        quizzes = [q for q in quizzes if search.lower() in q["title"].lower()]
+
+    results = []
+    bot_username = (await context.bot.get_me()).username
+    for q in quizzes[:10]:
+        quiz_id = str(q["_id"])
+        startgroup_link = "https://t.me/" + bot_username + "?startgroup=quiz_" + quiz_id
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="Quiz: " + q["title"],
+                description=str(q["total"]) + " questions — Group mein share karein",
+                input_message_content=InputTextMessageContent(
+                    "Quiz: *" + q["title"] + "*\n" +
+                    str(q["total"]) + " questions\n\n" +
+                    "Group mein start karne ke liye neeche button dabao!",
+                    parse_mode='Markdown'
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Quiz Start Karein", url=startgroup_link)]
+                ])
+            )
+        )
+
+    await query.answer(results, cache_time=10)
+
 async def startquiz_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /startquiz_<quiz_id> command in groups"""
     user_id = update.effective_user.id
@@ -2151,10 +2232,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data.startswith("runq_group_"):
         quiz_id = query.data[11:]
         bot_username = (await context.bot.get_me()).username
-        share_text = f"Quiz shuru karne ke liye bot ko group mein add karein aur /startquiz_{quiz_id} command chalayein!"
-        await query.answer(
-            f"Group mein bot add karein aur ye command chalayein:\n/startquiz_{quiz_id}",
-            show_alert=True
+        startgroup_link = "https://t.me/" + bot_username + "?startgroup=quiz_" + quiz_id
+        keyboard = [
+            [InlineKeyboardButton("👥 Group mein Add Karein & Start Karein", url=startgroup_link)]
+        ]
+        await query.answer()
+        await query.message.reply_text(
+            "👥 *Group mein Quiz Start Karein*\n\n"
+            "Neeche button dabao — bot apne group mein add hoga aur quiz automatically shuru ho jaayegi!\n\n"
+            "Ya yeh link copy karke group admin ko bhejo:\n"
+            "`" + startgroup_link + "`",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     elif query.data.startswith("delq_"):
@@ -2318,6 +2407,8 @@ async def main_async() -> None:
     application.add_handler(CommandHandler("redeem", redeem_command))
     application.add_handler(MessageHandler(filters.Document.TEXT, handle_document_wrapper))
     application.add_handler(CommandHandler("myquiz", myquiz_command))
+    from telegram.ext import InlineQueryHandler
+    application.add_handler(InlineQueryHandler(handle_inline_query))
     application.add_handler(MessageHandler(filters.COMMAND & filters.Regex(r"^/startquiz_"), startquiz_group_command))
     # Poll close is handled via PollAnswerHandler — no separate handler needed
     application.add_handler(PollAnswerHandler(handle_poll_answer_track))
