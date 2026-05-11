@@ -1039,7 +1039,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             opt_clean = opt_prefix_re.sub('', opt).strip()
                             options_text += option_labels[idx] + ") " + opt_clean + "\n"
 
-                        msg_text = "📋 *Question:*\n```\n" + question + "\n\n" + options_text.rstrip() + "\n```"
+                        msg_text = "*📋 Question:*\n```\n" + question + "\n\n" + options_text.rstrip() + "\n```"
 
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
