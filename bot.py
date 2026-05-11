@@ -1253,7 +1253,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         poll_params = {
                             "chat_id": update.effective_chat.id,
                             "question": question,
-                            "options": options,
+                            "options": [opt[:100] for opt in options],
                             "type": 'quiz',
                             "correct_option_id": correct_id,
                             "is_anonymous": False,
@@ -2095,10 +2095,12 @@ async def send_quiz_question(bot, session_id: str):
                 explanation=explanation[:200] if explanation else None
             )
         else:
+            # Truncate each option to Telegram's 100-char limit
+            safe_options = [opt[:100] for opt in options]
             poll_kwargs = {
                 "chat_id": chat_id,
                 "question": question_text,
-                "options": options,
+                "options": safe_options,
                 "type": 'quiz',
                 "correct_option_id": correct_id,
                 "is_anonymous": False,
