@@ -2400,7 +2400,8 @@ async def send_quiz_question(bot, session_id: str):
         options_exceed    = any(len(opt) > POLL_OPTION_MAX_LENGTH for opt in options)
         explanation_exceeds = explanation and len(explanation) > POLL_EXPLANATION_MAX_LENGTH
 
-        # If anything is too long → send full text message first, then poll
+        # If anything is too long → send full text message first, poll as reply to it
+        ref_message_id = None
         if question_exceeds or options_exceed or explanation_exceeds:
             full_text = f"📋 <b>Question {idx + 1}/{total_questions}</b>\n\n"
             if question_exceeds:
@@ -2411,7 +2412,9 @@ async def send_quiz_question(bot, session_id: str):
                     if len(opt) > POLL_OPTION_MAX_LENGTH:
                         full_text += f"{i + 1}. {opt}\n"
                 full_text += "\n"
-            await bot.send_message(chat_id=chat_id, text=full_text, parse_mode='HTML')
+            ref_msg = await bot.send_message(chat_id=chat_id, text=full_text, parse_mode='HTML')
+            ref_message_id = ref_msg.message_id
+            await asyncio.sleep(1)
 
         # Prepare trimmed poll content
         formatted_question = f"[{idx + 1}/{total_questions}] {question_text}"
@@ -2439,6 +2442,8 @@ async def send_quiz_question(bot, session_id: str):
         }
         if trimmed_explanation:
             poll_kwargs["explanation"] = trimmed_explanation
+        if ref_message_id:
+            poll_kwargs["reply_to_message_id"] = ref_message_id
 
         sent = await bot.send_poll(**poll_kwargs)
 
