@@ -2383,57 +2383,64 @@ async def send_quiz_question(bot, session_id: str):
 
     opt_prefix_re2 = __import__('re').compile(r'^[A-Da-d][\.\):\s]+')
 
+    # Constants (from bot__2_.py logic)
+    POLL_QUESTION_MAX_LENGTH = 195
+    POLL_OPTION_MAX_LENGTH   = 95
+    POLL_EXPLANATION_MAX_LENGTH = 200
+    TRIM_LENGTH = 80
+
+    def _trim(text, max_len):
+        if len(text) <= max_len:
+            return text
+        return text[:max_len - 1] + "…"
+
     try:
-        any_long_option = any(len(opt) > 100 for opt in options)
-        POLL_QUESTION_LIMIT = 300
+        total_questions = len(questions)
+        question_exceeds  = len(question_text) > POLL_QUESTION_MAX_LENGTH
+        options_exceed    = any(len(opt) > POLL_OPTION_MAX_LENGTH for opt in options)
+        explanation_exceeds = explanation and len(explanation) > POLL_EXPLANATION_MAX_LENGTH
 
-        if len(question_text) > POLL_QUESTION_LIMIT or any_long_option:
-            option_labels = ['A', 'B', 'C', 'D']
+        # If anything is too long → send full text message first, then poll
+        if question_exceeds or options_exceed or explanation_exceeds:
+            full_text = f"📋 <b>Question {idx + 1}/{total_questions}</b>\n\n"
+            if question_exceeds:
+                full_text += f"<b>Q:</b> {question_text}\n\n"
+            if options_exceed:
+                full_text += "<b>Options:</b>\n"
+                for i, opt in enumerate(options):
+                    if len(opt) > POLL_OPTION_MAX_LENGTH:
+                        full_text += f"{i + 1}. {opt}\n"
+                full_text += "\n"
+            await bot.send_message(chat_id=chat_id, text=full_text, parse_mode='HTML')
 
-            # Send full question as message first (like screenshot style)
-            msg_text = f"Q{idx + 1}/{len(questions)}: {question_text}\n\nOptions:\n"
-            for i, opt in enumerate(options):
-                opt_clean = opt_prefix_re2.sub('', opt).strip()
-                msg_text += f"  {option_labels[i]}) {opt_clean}\n"
-            ref_msg = await bot.send_message(chat_id=chat_id, text=msg_text)
+        # Prepare trimmed poll content
+        formatted_question = f"[{idx + 1}/{total_questions}] {question_text}"
+        trimmed_question = _trim(formatted_question, POLL_QUESTION_MAX_LENGTH) \
+            if len(formatted_question) > POLL_QUESTION_MAX_LENGTH else formatted_question
 
-            # Truncate question for poll (100 chars + ...)
-            truncated_q = question_text[:100].rstrip() + "..." if len(question_text) > 100 else question_text
-            poll_question = f"[{idx + 1}/{len(questions)}] {truncated_q}"
+        trimmed_options = []
+        for opt in options:
+            trimmed_options.append(_trim(opt, POLL_OPTION_MAX_LENGTH) \
+                if len(opt) > POLL_OPTION_MAX_LENGTH else opt)
 
-            # Truncate options for poll (50 chars + ...)
-            poll_options = []
-            for i, label in enumerate(option_labels):
-                opt_clean = opt_prefix_re2.sub('', options[i]).strip()
-                short_opt = opt_clean[:50].rstrip() + "..." if len(opt_clean) > 50 else opt_clean
-                poll_options.append((label + ") " + short_opt)[:100])
+        trimmed_explanation = None
+        if explanation:
+            trimmed_explanation = _trim(explanation, POLL_EXPLANATION_MAX_LENGTH) \
+                if len(explanation) > POLL_EXPLANATION_MAX_LENGTH else explanation
 
-            sent = await bot.send_poll(
-                chat_id=chat_id,
-                question=poll_question[:300],
-                options=poll_options,
-                type='quiz',
-                correct_option_id=correct_id,
-                is_anonymous=False,
-                open_period=open_period,
-                reply_to_message_id=ref_msg.message_id,
-                explanation=explanation[:200] if explanation else None
-            )
-        else:
-            # Short question — send directly in poll
-            safe_options = [opt[:100] for opt in options]
-            poll_kwargs = {
-                "chat_id": chat_id,
-                "question": f"[{idx + 1}/{len(questions)}] " + question_text[:280],
-                "options": safe_options,
-                "type": 'quiz',
-                "correct_option_id": correct_id,
-                "is_anonymous": False,
-                "open_period": open_period
-            }
-            if explanation:
-                poll_kwargs["explanation"] = explanation
-            sent = await bot.send_poll(**poll_kwargs)
+        poll_kwargs = {
+            "chat_id": chat_id,
+            "question": trimmed_question,
+            "options": trimmed_options,
+            "type": 'quiz',
+            "correct_option_id": correct_id,
+            "is_anonymous": False,
+            "open_period": open_period,
+        }
+        if trimmed_explanation:
+            poll_kwargs["explanation"] = trimmed_explanation
+
+        sent = await bot.send_poll(**poll_kwargs)
 
         # Store poll info
         session["poll_message_id"] = sent.message_id
