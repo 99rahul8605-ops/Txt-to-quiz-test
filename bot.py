@@ -2384,43 +2384,43 @@ async def send_quiz_question(bot, session_id: str):
     opt_prefix_re2 = __import__('re').compile(r'^[A-Da-d][\.\):\s]+')
 
     try:
+        any_long_option = any(len(opt) > 100 for opt in options)
         POLL_QUESTION_LIMIT = 300
-        if len(question_text) > POLL_QUESTION_LIMIT:
+
+        if len(question_text) > POLL_QUESTION_LIMIT or any_long_option:
             option_labels = ['A', 'B', 'C', 'D']
 
-            # Build message exactly like screenshot:
-            # Q9/10: Q2. <question text>
-            # 1. option1
-            # 2. option2
-            # ...
-            # Options:
-            #   A) ...
-            #   B) ...
-            msg_text = f"Q{idx + 1}/{len(questions)}: {question_text}\n"
-            msg_text += "\nOptions:\n"
+            # Send full question as message first (like screenshot style)
+            msg_text = f"Q{idx + 1}/{len(questions)}: {question_text}\n\nOptions:\n"
             for i, opt in enumerate(options):
                 opt_clean = opt_prefix_re2.sub('', opt).strip()
                 msg_text += f"  {option_labels[i]}) {opt_clean}\n"
+            ref_msg = await bot.send_message(chat_id=chat_id, text=msg_text)
 
-            await bot.send_message(chat_id=chat_id, text=msg_text)
+            # Truncate question for poll (100 chars + ...)
+            truncated_q = question_text[:100].rstrip() + "..." if len(question_text) > 100 else question_text
+            poll_question = f"[{idx + 1}/{len(questions)}] {truncated_q}"
 
+            # Truncate options for poll (50 chars + ...)
             poll_options = []
             for i, label in enumerate(option_labels):
                 opt_clean = opt_prefix_re2.sub('', options[i]).strip()
-                poll_options.append((label + ") " + opt_clean)[:100])
+                short_opt = opt_clean[:50].rstrip() + "..." if len(opt_clean) > 50 else opt_clean
+                poll_options.append((label + ") " + short_opt)[:100])
 
             sent = await bot.send_poll(
                 chat_id=chat_id,
-                question=f"[{idx + 1}/{len(questions)}] {question_text[:280]}",
+                question=poll_question[:300],
                 options=poll_options,
                 type='quiz',
                 correct_option_id=correct_id,
                 is_anonymous=False,
                 open_period=open_period,
+                reply_to_message_id=ref_msg.message_id,
                 explanation=explanation[:200] if explanation else None
             )
         else:
-            # Truncate each option to Telegram's 100-char limit
+            # Short question — send directly in poll
             safe_options = [opt[:100] for opt in options]
             poll_kwargs = {
                 "chat_id": chat_id,
